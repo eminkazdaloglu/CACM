@@ -117,6 +117,71 @@ class StateEncoder(nn.Module):
             return result.cuda()
         else:
             return result
+        
+        
+# conversion context encoder，encode all user interactions within a session
+class ConversionEncoder(nn.Module):
+    def __init__(self, args, url_size, vtype_size, rank_size=11, n_layers=1):
+        super(StateEncoder, self).__init__()
+        self.args = args
+        self.n_layers = n_layers
+        self.embed_size = args.embed_size
+        self.conv_emb_size = args.conv_emb_size
+        self.hidden_size = args.hidden_size
+        self.dropout_rate = args.dropout_rate
+        self.use_knowledge = args.use_knowledge
+        self.encode_gru_num_layer = 1
+
+        self.url_size = url_size
+        self.rank_size = rank_size
+        self.vtype_size = vtype_size
+
+        self.url_embedding = nn.Embedding(url_size, self.embed_size)
+        self.rank_embedding = nn.Embedding(rank_size, 4)
+        self.vtype_embedding = nn.Embedding(vtype_size, 8)
+        self.conv_embedding = nn.Embedding(2, self.conv_emb_size) ##Input size = 2, output size --> Opsional (args)
+
+        self.gru = nn.GRU(self.embed_size + 16, self.hidden_size,
+                          batch_first=True, dropout=self.dropout_rate, num_layers=self.encode_gru_num_layer)
+
+    def forward(self, urls, ranks, vtypes, conversions, hidden, data):
+        uid_nid = data.uid_nid
+        node_emb = data.node_emb
+        if self.use_knowledge:
+            batch_embeds = []
+            for url_batch in urls:
+                batch_embed = []
+                for url in url_batch:
+                    try:
+                        this_embed = url.data.cpu().numpy().tolist()
+                        this_embed = node_emb[uid_nid[str(this_embed).decode('utf-8')]]
+                        this_embed = Variable(torch.from_numpy(np.array(this_embed, dtype=np.float32)))
+                        if use_cuda:
+                            this_embed = this_embed.cuda()
+                    except:
+                        this_embed = self.url_embedding(url)
+                    batch_embed.append(this_embed)
+                batch_embed = torch.stack(tuple(batch_embed), dim=0)
+                batch_embeds.append(batch_embed)
+            url_embed = torch.stack(tuple(batch_embeds), dim=0)
+        else:
+            url_embed = self.url_embedding(urls)  # batch_size, session_doc_num, embed_size
+        rank_embed = self.rank_embedding(ranks)  # batch_size, session_doc_num, 4
+        vtype_embed = self.vtype_embedding(vtypes)  # batch_size, session_doc_num, 8
+        conv_embed = self.conv_embedding(conversions)  # batch_size, session_doc_num, conv_emb_size
+
+        gru_input = torch.cat((url_embed, rank_embed, vtype_embed, conv_embed), dim=2)
+        output = gru_input
+        for i in range(self.n_layers):
+            output, hidden = self.gru(gru_input, hidden)
+        return output, hidden
+
+    def initHidden(self):
+        result = Variable(torch.zeros(1, 1, self.hidden_size))
+        if use_cuda:
+            return result.cuda()
+        else:
+            return result
 
 
 # document encoder, encode one document each time
@@ -190,6 +255,25 @@ class RelevanceEstimator(nn.Module):
     def forward(self, input, batch_size):
         output = self.tanh(self.out1(input))
         output = self.sigmoid(self.out2(output)).view(batch_size, -1, 1)
+        return output
+
+
+# conversion estimator
+class ConversionEstimator(nn.Module):
+    def __init__(self, input_size, hidden_size, n_layers=1):
+        super(ConversionEstimator, self).__init__()
+        self.n_layers = n_layers
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+
+        self.out1 = nn.Linear(input_size, hidden_size // 2)
+        self.out2 = nn.Linear(hidden_size // 2, 1)
+        self.sigmoid = nn.Sigmoid()
+        self.tanh = nn.Tanh()
+
+    def forward(self, input, batch_size):
+        output = self.tanh(self.out1(input))  # Hidden layer
+        output = self.sigmoid(self.out2(output)).view(batch_size, -1, 1)  # Final output
         return output
 
 

@@ -8,7 +8,7 @@
 import logging
 import torch
 from torch import nn
-from modules import KnowledgeEncoder, StateEncoder, DocumentEncoder, RelevanceEstimator, ExamPredictor
+from modules import KnowledgeEncoder, StateEncoder, DocumentEncoder, ConversionEncoder, RelevanceEstimator, ConversionEstimator, ExamPredictor
 
 MINF = 1e-30
 use_cuda = torch.cuda.is_available()
@@ -47,6 +47,7 @@ class CACMN(nn.Module):
         # context-aware relevance estimator
         self.knowledge_encoder = KnowledgeEncoder(self.args, self.query_size)
         self.state_encoder = StateEncoder(self.args, self.url_size, self.vtype_size)
+        self.conversion_encoder = ConversionEncoder(self.args, self.url_size, self.vtype_size) ###
         self.document_encoder = DocumentEncoder(self.args, self.url_size, self.vtype_size)
         self.relevance_estimator = RelevanceEstimator(self.args.hidden_size * 3, args.hidden_size)
 
@@ -85,27 +86,47 @@ class CACMN(nn.Module):
             self.w31.data.fill_(0.5)
             self.w32.data.fill_(0.5)
 
-    def get_clicks(self, relevances, exams):
-        clicks = []
+    # def get_clicks(self, relevances, exams):
+    #     clicks = []
+    #     combine = self.args.combine
+    #     if combine == 'mul':
+    #         clicks = torch.mul(relevances, exams)
+    #     elif combine == 'exp_mul':
+    #         clicks = torch.mul(torch.pow(relevances, self.lamda), torch.pow(exams, self.mu))
+    #     elif combine == 'linear':
+    #         clicks = torch.add(torch.mul(relevances, self.alpha), torch.mul(exams, self.beta))
+    #     elif combine == 'nonlinear':  # 2-layer
+    #         out1 = self.sigmoid(torch.add(torch.mul(relevances, self.w11), torch.mul(exams, self.w12)))
+    #         out2 = self.sigmoid(torch.add(torch.mul(relevances, self.w21), torch.mul(exams, self.w22)))
+    #         clicks = self.sigmoid(torch.add(torch.mul(out1, self.w31), torch.mul(out2, self.w32)))
+    #     elif combine == 'sigmoid_log':
+    #         clicks = 4 * torch.div(torch.mul(relevances, exams),
+    #                                 torch.mul(torch.add(relevances, 1), torch.add(exams, 1)))
+
+    #     return clicks
+
+    def combination_layer(self, input_1, input_2):
+        outputs = []
         combine = self.args.combine
         if combine == 'mul':
-            clicks = torch.mul(relevances, exams)
+            outputs = torch.mul(input_1, input_2)
         elif combine == 'exp_mul':
-            clicks = torch.mul(torch.pow(relevances, self.lamda), torch.pow(exams, self.mu))
+            outputs = torch.mul(torch.pow(input_1, self.lamda), torch.pow(input_2, self.mu))
         elif combine == 'linear':
-            clicks = torch.add(torch.mul(relevances, self.alpha), torch.mul(exams, self.beta))
+            outputs = torch.add(torch.mul(input_1, self.alpha), torch.mul(input_2, self.beta))
         elif combine == 'nonlinear':  # 2-layer
-            out1 = self.sigmoid(torch.add(torch.mul(relevances, self.w11), torch.mul(exams, self.w12)))
-            out2 = self.sigmoid(torch.add(torch.mul(relevances, self.w21), torch.mul(exams, self.w22)))
-            clicks = self.sigmoid(torch.add(torch.mul(out1, self.w31), torch.mul(out2, self.w32)))
+            out1 = self.sigmoid(torch.add(torch.mul(input_1, self.w11), torch.mul(input_2, self.w12)))
+            out2 = self.sigmoid(torch.add(torch.mul(input_1, self.w21), torch.mul(input_2, self.w22)))
+            outputs = self.sigmoid(torch.add(torch.mul(out1, self.w31), torch.mul(out2, self.w32)))
         elif combine == 'sigmoid_log':
-            clicks = 4 * torch.div(torch.mul(relevances, exams),
-                                    torch.mul(torch.add(relevances, 1), torch.add(exams, 1)))
+            outputs = 4 * torch.div(torch.mul(input_1, input_2),
+                                    torch.mul(torch.add(input_1, 1), torch.add(input_2, 1)))
 
-        return clicks
+        return outputs
 
     # inputs include: knowledge, interaction, document
-    def forward(self, knowledge_variable, interaction_variable, document_variable, examination_context, data):
+    def forward(self, knowledge_variable, interaction_variable, conversion_variable, document_variable, examination_context, data):
+        # Assume interaction variable contains conversion related data
         # every variable correspond to a query-doc pair, which is to be predicted
         # forward one query session at a time
 
@@ -141,7 +162,7 @@ class CACMN(nn.Module):
         interaction_input_variable = interaction_input_variable.cuda() if use_cuda else interaction_input_variable
         interaction_hidden = self.state_encoder.initHidden()
 
-        # interaction_input_variable[:, :, i] has 4 parts: url, rank, vtype, click, each one is a one-hot vector
+        # interaction_input_variable[:, :, i] has 4 parts: url, rank, vtype, click each one is a one-hot vector
         interaction_output, interaction_hidden = self.state_encoder.forward(
             interaction_input_variable[:, :, 0], interaction_input_variable[:, :, 1],
             interaction_input_variable[:, :, 2],
@@ -163,6 +184,36 @@ class CACMN(nn.Module):
                 batch_interaction_output = torch.stack(tuple(batch_interaction_output), 0)
                 interaction_attention_output.append(batch_interaction_output)
             interaction_output = torch.stack(tuple(interaction_attention_output), 0)
+
+        # conversion encoding from conversion
+        # conversion: batch_size * session_doc_num * data
+        conversion_input_variable = conversion_variable
+        conversion_input_variable = conversion_input_variable.cuda() if use_cuda else conversion_input_variable
+        conversion_hidden = self.conversion_encoder.initHidden()
+
+        # conversion_input_variable[:, :, i] has 4 parts: url, rank, vtype, conversion, each one is a one-hot vector (ignore clicks)
+        conversion_output, conversion_hidden = self.conversion_encoder.forward(conversion_input_variable[:, :, 0], 
+                                                                                conversion_input_variable[:, :, 1],
+                                                                                conversion_input_variable[:, :, 2],
+                                                                                conversion_input_variable[:, :, 3], 
+                                                                                conversion_hidden, data) ## index 4 --> Conversion
+
+        if self.use_state_attention:
+            conversion_attention_output = []
+            for batch_idx, batch_conversion in enumerate(conversion_output):
+                batch_conversion_output = []
+                for sess_pos_idx, conversion in enumerate(batch_conversion):
+                    prev_hidden = conversion_output[batch_idx][: sess_pos_idx + 1]
+                    conversion = conversion.view(1, -1)
+                    a = torch.mm(conversion, torch.transpose(prev_hidden, 0, 1))
+                    a = self.softmax2(a).view(-1, 1)
+
+                    conversion_memory = torch.mul(prev_hidden, a)
+                    this_conversion_output = conversion_memory.sum(dim=0)
+                    batch_conversion_output.append(this_conversion_output)
+                batch_conversion_output = torch.stack(tuple(batch_conversion_output), 0)
+                conversion_attention_output.append(batch_conversion_output)
+            conversion_output = torch.stack(tuple(conversion_attention_output), 0)
 
         # document encoding
         # document_input_variable has 3 parts: url, rank, vtype, each one is a one-hot vector
@@ -200,5 +251,10 @@ class CACMN(nn.Module):
         exam_prob = examination_output
 
         # combine the relevance and the examination according to the combination type
-        clicks = self.get_clicks(relevance, exam_prob)
-        return relevance, exam_prob, clicks
+        clicks = self.combination_layer(relevance, exam_prob)
+
+        # combine the clicks and the conversion_output according to the combination type
+        estimated_conversion = self.conversion_estimator.forward(conversion_output, self.batch_size)
+        conversions = self.combination_layer(clicks, estimated_conversion)
+
+        return relevance, exam_prob, clicks, conversions
